@@ -58,9 +58,7 @@ if _is_cuda:
     ):
         _enable_jit_deepgemm = True
 
-
 logger = logging.getLogger(__name__)
-
 
 if supports_custom_op():
 
@@ -275,6 +273,8 @@ def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -282,11 +282,28 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=_fp8_type)
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
+    if column_major_scales:
+        if scale_tma_aligned:
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x.shape[-2] + 3) // 4 * 4
+            x_s = torch.empty(
+                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
+        else:
+            x_s = torch.empty(
+                (x.shape[-1] // group_size,) + x.shape[:-1],
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
+    else:
+        x_s = torch.empty(
+            x.shape[:-1] + (x.shape[-1] // group_size,),
+            device=x.device,
+            dtype=torch.float32,
+        )
+
     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
@@ -878,16 +895,20 @@ def _per_tensor_quant_mla_fp8_stage2(
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, eps: float = 1e-12
+    x: torch.Tensor, x_s_out: torch.Tensor, eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
+    assert (
+        x_s_out.shape == (1,)
+        and x_s_out.dtype == torch.float32
+        and x_s_out.device == x.device
+    )
 
     x_q = x.new_empty(x.size(), dtype=_fp8_type)
-    x_s = torch.zeros((1,), dtype=torch.float32, device=x.device)
 
     num_head, num_seq, head_size = x.shape
     BLOCK_SIZE = triton.next_power_of_2(head_size)
@@ -895,7 +916,7 @@ def per_tensor_quant_mla_fp8(
 
     _per_tensor_quant_mla_fp8_stage1[grid](
         x,
-        x_s,
+        x_s_out,
         head_size,
         x.stride(0),
         x.stride(1),
@@ -905,7 +926,7 @@ def per_tensor_quant_mla_fp8(
     )
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
-        x_s,
+        x_s_out,
         x_q,
         num_seq,
         head_size,
@@ -916,7 +937,7 @@ def per_tensor_quant_mla_fp8(
         BLOCK_SIZE,
     )
 
-    return x_q, x_s
+    return x_q, x_s_out
 
 
 def scaled_fp8_quant(
